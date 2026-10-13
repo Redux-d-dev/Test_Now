@@ -72,9 +72,10 @@ async def main() -> None:
     opts = options.Options(
         listen_host="0.0.0.0",
         listen_port=PORT,
-        proxyauth=f"{USER}:{PASS}",
     )
     master = DumpMaster(opts, with_termlog=True, with_dumper=False)
+    # proxyauth is registered by an addon that DumpMaster loads, so it can only be set after the master exists
+    master.options.update(proxyauth=f"{USER}:{PASS}")
     master.addons.add(Probe())
     print(f"[probe] forward proxy starting on 0.0.0.0:{PORT} (auth required)", flush=True)
     await master.run()
