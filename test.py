@@ -1,59 +1,41 @@
 """
-proxy_test.py - STANDALONE test. Touches nothing else in this project.
+ws_relay_test.py - STANDALONE SERVER-SIDE test (deploy this on Render). Touches nothing else.
 
-Question it answers: can a mitmproxy FORWARD proxy be reached through a public
-host:port (e.g. your Render URL), the way a Chrome extension would use it?
+Question it answers: Render only lets normal website traffic (and WebSockets) through, not
+proxy traffic. Can we carry proxy traffic INSIDE a WebSocket instead?
 
-What it does: starts mitmproxy in regular (forward proxy) mode on $PORT, protected
-by a username/password, and prints a "[probe]" line for everything that reaches it.
-That log tells you whether Render's front door lets proxy traffic (CONNECT) through.
+How it works:
+    - mitmproxy (forward proxy) listens on 127.0.0.1:8081, INSIDE the container only.
+    - A web server on $PORT exposes  wss://<app>.onrender.com/tunnel?token=...
+      Every WebSocket opened there is piped, byte for byte, to mitmproxy.
+    - GET /  answers "ok" (Render health check).
+    - The token is hardcoded for this test (env TUNNEL_TOKEN overrides it).
 
-Needs: pip install mitmproxy
+Needs: pip install mitmproxy aiohttp
+Render: Start command  ->  python ws_relay_test.py   (use this file's name)
 
-Env vars:
-    PROXY_USER, PROXY_PASS   optional. Hardcoded defaults for this test: tester / testpass123
-                             (the proxy always requires a login, so it is never an open proxy).
-    PORT                     Render sets it itself; locally it defaults to 8080.
+The local half is ws_client_test.py. See the steps at the top of that file.
 
-Render: Start command  ->  python proxy_test.py
-        (if the build fails on the Python version, mitmproxy needs a recent Python: set the
-         PYTHON_VERSION env var in Render)
-
---- Test 1: locally first (should work, proves the script itself is fine) ---
-    python proxy_test.py
-    curl -v -k -x http://tester:testpass123@localhost:8080 https://example.com
-
---- Test 2: through Render (-k because mitmproxy re-signs example.com with its own CA) ---
-    curl -v -k -x https://tester:testpass123@YOUR-APP.onrender.com:443 https://example.com
-
---- Test 3: plain http through Render (no CONNECT involved) ---
-    curl -v -x https://tester:testpass123@YOUR-APP.onrender.com:443 http://example.com
-
-How to read it (curl output + Render logs):
-    Render log shows "[probe] CONNECT received"  -> a forward proxy works through Render.
-    curl says "CONNECT tunnel failed" and the log
-      shows NO "[probe]" line                    -> Render's front door blocks CONNECT.
-    Test 3 works but Test 2 fails                -> only CONNECT (https) is blocked.
-    curl gets 407                                -> it reached the proxy; check user/pass.
+Render log lines to look for:
+    [relay] mitmproxy listening on 127.0.0.1:8081
+    [relay] tunnel opened            -> a WebSocket got through Render's front door
+    [probe] CONNECT received -> ...  -> proxy traffic travelled through the tunnel
 """
 import asyncio
 import os
-import sys
 
+from aiohttp import WSMsgType, web
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
 
 PORT = int(os.environ.get("PORT", "8080"))
-# Hardcoded for this throwaway test (env vars still override if set)
-USER = os.environ.get("PROXY_USER", "tester")
-PASS = os.environ.get("PROXY_PASS", "testpass123")
+TOKEN = os.environ.get("TUNNEL_TOKEN", "test-token-123")
+MITM_HOST = "127.0.0.1"
+MITM_PORT = 8081
 
 
 class Probe:
     """Logs only. Never changes any traffic."""
-
-    def client_connected(self, client):
-        print(f"[probe] TCP connection from {client.peername}", flush=True)
 
     def http_connect(self, flow):
         print(f"[probe] CONNECT received -> {flow.request.host}:{flow.request.port}", flush=True)
@@ -65,20 +47,72 @@ class Probe:
         print(f"[probe] flow error: {flow.error}", flush=True)
 
 
-async def main() -> None:
-    if not USER or not PASS or ":" in USER or ":" in PASS:
-        sys.exit("Set PROXY_USER and PROXY_PASS (no ':' in either). Refusing to run as an open proxy.")
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
 
-    opts = options.Options(
-        listen_host="0.0.0.0",
-        listen_port=PORT,
-    )
+
+async def tunnel(request: web.Request) -> web.WebSocketResponse:
+    if request.query.get("token") != TOKEN:
+        return web.Response(status=403, text="forbidden")  # type: ignore[return-value]
+
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0)
+    await ws.prepare(request)
+    print("[relay] tunnel opened", flush=True)
+
+    try:
+        reader, writer = await asyncio.open_connection(MITM_HOST, MITM_PORT)
+    except OSError as exc:
+        print(f"[relay] cannot reach mitmproxy: {exc}", flush=True)
+        await ws.close(code=1011, message=b"proxy down")
+        return ws
+
+    async def up() -> None:  # websocket -> mitmproxy
+        async for msg in ws:
+            if msg.type == WSMsgType.BINARY:
+                writer.write(msg.data)
+                await writer.drain()
+            else:
+                break
+
+    async def down() -> None:  # mitmproxy -> websocket
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            await ws.send_bytes(data)
+
+    tasks = [asyncio.create_task(up()), asyncio.create_task(down())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        writer.close()
+        if not ws.closed:
+            await ws.close()
+        print("[relay] tunnel closed", flush=True)
+    return ws
+
+
+async def main() -> None:
+    opts = options.Options(listen_host=MITM_HOST, listen_port=MITM_PORT)
     master = DumpMaster(opts, with_termlog=True, with_dumper=False)
-    # proxyauth is registered by an addon that DumpMaster loads, so it can only be set after the master exists
-    master.options.update(proxyauth=f"{USER}:{PASS}")
     master.addons.add(Probe())
-    print(f"[probe] forward proxy starting on 0.0.0.0:{PORT} (auth required)", flush=True)
-    await master.run()
+    mitm_task = asyncio.create_task(master.run())
+    await asyncio.sleep(3)
+    if mitm_task.done():
+        mitm_task.result()  # raises the real error if mitmproxy failed to start
+    print(f"[relay] mitmproxy listening on {MITM_HOST}:{MITM_PORT}", flush=True)
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/tunnel", tunnel)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    print(f"[relay] web server on 0.0.0.0:{PORT}", flush=True)
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
